@@ -14,7 +14,7 @@ Help:
 ```
 $ python mcp_repl.py --help
 
-usage: mcp_repl.py [-h] [[--stdio STDIO] [url]+] [-c CMD] 
+usage: mcp_repl.py [URL ...] [--stdio STDIO ...] [-c CMD]
 
 Minimal MCP tester REPL
 
@@ -22,6 +22,9 @@ options:
   -h, --help     show this help message and exit
   --stdio STDIO  stdio server command, e.g. --stdio "python qwenmcp.py"
   -c, --cmd CMD  run command and exit, e.g. -c "web_fetch https://example.com"
+
+Pass one or more MCP server URLs, and repeat --stdio for stdio servers.
+Defaults to http://localhost:8000/ when no server is given.
 ```
 
 Run it from cli:

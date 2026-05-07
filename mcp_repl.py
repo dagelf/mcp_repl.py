@@ -302,8 +302,12 @@ async def add_server(stack, servers, spec):
 
 
 async def main():
-    ap = argparse.ArgumentParser(description="Minimal MCP tester REPL")
-    ap.add_argument("url", nargs="*", help="streamable HTTP MCP server URL(s)")
+    ap = argparse.ArgumentParser(
+        description="Minimal MCP tester REPL",
+        epilog="Pass one or more MCP server URLs, and repeat --stdio for stdio servers. Defaults to http://localhost:8000/ when no server is given.",
+        usage="%(prog)s [URL ...] [--stdio STDIO ...] [-c CMD]",
+    )
+    ap.add_argument("url", nargs="*", metavar="URL", help=argparse.SUPPRESS)
     ap.add_argument("--stdio", action="append", default=[], help='stdio server command, e.g. --stdio "python qwenmcp.py"')
     ap.add_argument("-c", "--cmd", action="append", help='run command and exit, e.g. -c "web_fetch https://example.com"')
     args = ap.parse_args()
