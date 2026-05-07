@@ -6,14 +6,14 @@
 import argparse
 import asyncio
 import json
-import socket
 import readline
 import shlex
 import sys
+import urllib.error
+import urllib.request
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 
-import httpx
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -52,81 +52,32 @@ def err(msg):
     print(f"Error: {msg}", file=sys.stderr)
 
 
-def first_line(s):
-    return " ".join(str(s).strip().split())
-
-
-def snippet(s, limit=120):
-    s = first_line(s)
+def one_line(x, limit=160):
+    s = " ".join(str(x).strip().split())
     return s if len(s) <= limit else s[: limit - 3] + "..."
 
 
-def iter_errors(e):
+def error_text(e):
     if isinstance(e, BaseExceptionGroup):
-        for child in e.exceptions:
-            yield from iter_errors(child)
-    else:
-        yield e
-
-
-def cause_chain(e):
-    while e:
-        yield e
-        e = e.__cause__ or e.__context__
-
-
-def friendly_error(e):
-    errors = list(iter_errors(e))
-    messages = []
-    for leaf in errors:
-        chain = list(cause_chain(leaf))
-        if any(isinstance(x, socket.gaierror) for x in chain):
-            messages.append("can't resolve host")
-        elif any(isinstance(x, (TimeoutError, httpx.TimeoutException)) for x in chain):
-            messages.append("timed out")
-        elif any(isinstance(x, (ConnectionRefusedError, httpx.ConnectError)) for x in chain):
-            messages.append("connection failed")
-        else:
-            msg = first_line(leaf)
-            messages.append(msg or leaf.__class__.__name__)
-    return "; ".join(dict.fromkeys(messages))
-
-
-async def probe_url(url):
-    try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
-            r = await client.get(url)
-    except Exception as e:
-        return friendly_error(e)
-    body = snippet(r.text)
-    ctype = r.headers.get("content-type", "").split(";", 1)[0] or "unknown content"
-    if "<html" in r.text[:500].lower():
-        return f"received HTML instead of MCP JSON: {body!r}"
-    if "json" not in ctype and "event-stream" not in ctype:
-        return f"received {ctype} instead of MCP JSON: {body!r}"
-    return f"HTTP {r.status_code} {ctype}: {body!r}"
+        return "; ".join(dict.fromkeys(error_text(x) for x in e.exceptions))
+    if isinstance(e, urllib.error.URLError):
+        return one_line(e.reason)
+    return one_line(e) or e.__class__.__name__
 
 
 async def preflight_url(url):
+    def get():
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return r.read(500).decode("utf-8", "replace")
+
     try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
-            r = await client.get(url)
-    except Exception as e:
-        raise ValueError(friendly_error(e)) from e
-    body = r.text[:500]
+        body = await asyncio.to_thread(get)
+    except urllib.error.HTTPError as e:
+        body = e.read(500).decode("utf-8", "replace")
+    except (urllib.error.URLError, ValueError) as e:
+        raise ValueError(error_text(e)) from e
     if "<html" in body.lower():
-        raise ValueError(f"received HTML instead of MCP JSON: {snippet(r.text)!r}")
-
-
-async def explain_connect_failure(label, e):
-    msg = friendly_error(e)
-    if label.startswith(("http://", "https://")) and not any(
-        x in msg for x in ("can't resolve host", "timed out", "connection failed", "received ")
-    ):
-        detail = await probe_url(label)
-        if detail:
-            msg = f"{msg}; {detail}"
-    err(f"{label}: connect failed: {msg}")
+        raise ValueError(f"received HTML instead of MCP JSON: {one_line(body)!r}")
 
 
 async def load_tools(servers):
@@ -138,7 +89,7 @@ async def load_tools(servers):
                     warn(f"duplicate tool {tool.name!r}; rightmost server will be used")
                 tools[tool.name] = BoundTool(tool, server)
         except Exception as e:
-            err(f"{server.label}: list_tools failed: {friendly_error(e)}")
+            err(f"{server.label}: list_tools failed: {error_text(e)}")
     return tools
 
 
@@ -261,10 +212,7 @@ async def run_line(stack, servers, tools, line):
         try:
             server = await add_server(stack, servers, spec)
         except Exception as e:
-            if spec.startswith(("http://", "https://")):
-                await explain_connect_failure(spec, e)
-            else:
-                err(f"load failed: {friendly_error(e)}")
+            err(f"load failed: {error_text(e)}")
             return tools, 1, False
         tools = await load_tools(servers)
         print(f"loaded {server.label}; {len(tools)} tools")
@@ -323,30 +271,32 @@ async def open_servers(args):
         try:
             servers.append(await open_url_server(stack, url))
         except Exception as e:
-            await explain_connect_failure(url, e)
+            err(f"{url}: connect failed: {error_text(e)}")
     for command in args.stdio:
         try:
             servers.append(await open_server(stack, f"stdio:{command}", connect_stdio(command)))
         except Exception as e:
-            err(f"stdio:{command}: connect failed: {friendly_error(e)}")
+            err(f"stdio:{command}: connect failed: {error_text(e)}")
     if servers:
         return stack, servers
-    else:
-        await stack.aclose()
-        raise RuntimeError("no MCP servers connected")
+    await stack.aclose()
+    raise RuntimeError("no MCP servers connected")
 
 
 async def add_server(stack, servers, spec):
     if not spec:
         raise ValueError("usage: add <url|stdio command|--stdio command>")
-    if spec.startswith("--stdio "):
-        command = spec.removeprefix("--stdio ").strip()
-        server = await open_server(stack, f"stdio:{command}", connect_stdio(command))
-    elif spec.startswith("stdio "):
-        command = spec.removeprefix("stdio ").strip()
-        server = await open_server(stack, f"stdio:{command}", connect_stdio(command))
+    for prefix in ("--stdio ", "stdio "):
+        if spec.startswith(prefix):
+            command = spec.removeprefix(prefix).strip()
+            break
     else:
+        command = None
+    label = spec if command is None else f"stdio:{command}"
+    if command is None:
         server = await open_url_server(stack, spec)
+    else:
+        server = await open_server(stack, label, connect_stdio(command))
     servers.append(server)
     return server
 
@@ -371,7 +321,7 @@ async def main():
                 except BaseException as e:
                     if isinstance(e, KeyboardInterrupt):
                         raise
-                    err(friendly_error(e))
+                    err(error_text(e))
                     rc, done = 1, False
                 code = code or rc
                 if done:
@@ -403,7 +353,7 @@ async def main():
             except BaseException as e:
                 if isinstance(e, KeyboardInterrupt):
                     raise
-                err(friendly_error(e))
+                err(error_text(e))
 
 
 if __name__ == "__main__":
@@ -414,5 +364,5 @@ if __name__ == "__main__":
     except BaseException as e:
         if isinstance(e, SystemExit):
             raise
-        err(friendly_error(e))
+        err(error_text(e))
         raise SystemExit(1)
