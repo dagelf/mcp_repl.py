@@ -1,25 +1,32 @@
-Use any MCP servers from the cli or in a REPL, with autocomplete and line editing
+Use any MCP servers from the cli or in a REPL, with autocomplete and line editing.
+
+Install Python, and then deps:
 
 ```
 $ python -m venv venv .venv
 $ source .venv/bin/activate
 $ pip install uv
 $ uv pip install mcp # parallel, so much faster
+```
 
+Help:
+
+```
 $ python mcp_repl.py --help
 
-usage: mcp_repl.py [-h] [--stdio STDIO] [-c CMD] [url]
+usage: mcp_repl.py [-h] [[--stdio STDIO] [url]+] [-c CMD] 
 
 Minimal MCP tester REPL
-
-positional arguments:
-  url
 
 options:
   -h, --help     show this help message and exit
   --stdio STDIO  stdio server command, e.g. --stdio "python qwenmcp.py"
   -c, --cmd CMD  run command and exit, e.g. -c "web_fetch https://example.com"
+```
 
+Run it from cli:
+
+```
 $ python mcp_repl.py http://127.0.0.1:8000 -c "web_fetch https://example.com"
 Status: 200
 Example Domain
@@ -27,10 +34,13 @@ Example Domain
 This domain is for use in documentation examples without needing permission. Avoid use in operations.
 [Learn more](https://iana.org/domains/example)
 
+```
+
+Or as a REPL:
+ 
+```
 $ python mcp_repl.py
 MCP REPL:  [call] <name> {json|k:v|pos...} | refresh | help | params | (exit|quit|q) | (tool|show) | (list|tools|ls)
-
-MCP REPL: tools | params <name> | tool <name> | | refresh | quit
 mcp> 
 call	refresh		help	params	(exit|quit|q)	(tool|show)	(tools|list|ls)
 mcp> tools
