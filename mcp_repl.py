@@ -304,7 +304,7 @@ async def add_server(stack, servers, spec):
 async def main():
     ap = argparse.ArgumentParser(
         description="Minimal MCP tester REPL",
-        epilog="Pass one or more MCP server URLs, and repeat --stdio for stdio servers. Defaults to http://localhost:8000/ when no server is given.",
+        epilog="Pass one or more MCP server URLs, or repeat --stdio for stdio servers. Defaults to http://localhost:8000/ when no server is given.",
         usage="%(prog)s [URL ...] [--stdio STDIO ...] [-c CMD]",
     )
     ap.add_argument("url", nargs="*", metavar="URL", help=argparse.SUPPRESS)
