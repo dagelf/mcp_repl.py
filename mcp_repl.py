@@ -6,21 +6,24 @@
 import argparse
 import asyncio
 import json
+import socket
 import readline
 import shlex
 import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 
+import httpx
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
 
-HELP = "[call] <name> {json|k:v|pos...} | refresh | help | params | (exit|quit|q) | (tool|show) | (list|tools|ls)"
+HELP = "[call] <name> {json|k:v|pos...} | refresh | help | params | (add|load) | (exit|quit|q) | (tool|show) | (list|tools|ls)"
 EXIT = {"exit", "quit", "q"}
 LIST = {"list", "tools", "ls"}
 SHOW = {"tool", "show"}
+ADD = {"add", "load"}
 
 
 @dataclass
@@ -49,6 +52,83 @@ def err(msg):
     print(f"Error: {msg}", file=sys.stderr)
 
 
+def first_line(s):
+    return " ".join(str(s).strip().split())
+
+
+def snippet(s, limit=120):
+    s = first_line(s)
+    return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def iter_errors(e):
+    if isinstance(e, BaseExceptionGroup):
+        for child in e.exceptions:
+            yield from iter_errors(child)
+    else:
+        yield e
+
+
+def cause_chain(e):
+    while e:
+        yield e
+        e = e.__cause__ or e.__context__
+
+
+def friendly_error(e):
+    errors = list(iter_errors(e))
+    messages = []
+    for leaf in errors:
+        chain = list(cause_chain(leaf))
+        if any(isinstance(x, socket.gaierror) for x in chain):
+            messages.append("can't resolve host")
+        elif any(isinstance(x, (TimeoutError, httpx.TimeoutException)) for x in chain):
+            messages.append("timed out")
+        elif any(isinstance(x, (ConnectionRefusedError, httpx.ConnectError)) for x in chain):
+            messages.append("connection failed")
+        else:
+            msg = first_line(leaf)
+            messages.append(msg or leaf.__class__.__name__)
+    return "; ".join(dict.fromkeys(messages))
+
+
+async def probe_url(url):
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+            r = await client.get(url)
+    except Exception as e:
+        return friendly_error(e)
+    body = snippet(r.text)
+    ctype = r.headers.get("content-type", "").split(";", 1)[0] or "unknown content"
+    if "<html" in r.text[:500].lower():
+        return f"received HTML instead of MCP JSON: {body!r}"
+    if "json" not in ctype and "event-stream" not in ctype:
+        return f"received {ctype} instead of MCP JSON: {body!r}"
+    return f"HTTP {r.status_code} {ctype}: {body!r}"
+
+
+async def preflight_url(url):
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+            r = await client.get(url)
+    except Exception as e:
+        raise ValueError(friendly_error(e)) from e
+    body = r.text[:500]
+    if "<html" in body.lower():
+        raise ValueError(f"received HTML instead of MCP JSON: {snippet(r.text)!r}")
+
+
+async def explain_connect_failure(label, e):
+    msg = friendly_error(e)
+    if label.startswith(("http://", "https://")) and not any(
+        x in msg for x in ("can't resolve host", "timed out", "connection failed", "received ")
+    ):
+        detail = await probe_url(label)
+        if detail:
+            msg = f"{msg}; {detail}"
+    err(f"{label}: connect failed: {msg}")
+
+
 async def load_tools(servers):
     tools = {}
     for server in servers:
@@ -58,7 +138,7 @@ async def load_tools(servers):
                     warn(f"duplicate tool {tool.name!r}; rightmost server will be used")
                 tools[tool.name] = BoundTool(tool, server)
         except Exception as e:
-            err(f"{server.label}: list_tools failed: {e}")
+            err(f"{server.label}: list_tools failed: {friendly_error(e)}")
     return tools
 
 
@@ -164,7 +244,7 @@ def need_arg(rest, usage):
     raise ValueError(f"usage: {usage}")
 
 
-async def run_line(servers, tools, line):
+async def run_line(stack, servers, tools, line):
     parts = line.strip().split(maxsplit=2)
     if not parts:
         return tools, 0, False
@@ -176,6 +256,18 @@ async def run_line(servers, tools, line):
     elif cmd == "refresh":
         tools = await load_tools(servers)
         print(f"{len(tools)} tools")
+    elif cmd in ADD:
+        spec = line.strip().split(maxsplit=1)[1] if len(parts) > 1 else ""
+        try:
+            server = await add_server(stack, servers, spec)
+        except Exception as e:
+            if spec.startswith(("http://", "https://")):
+                await explain_connect_failure(spec, e)
+            else:
+                err(f"load failed: {friendly_error(e)}")
+            return tools, 1, False
+        tools = await load_tools(servers)
+        print(f"loaded {server.label}; {len(tools)} tools")
     elif cmd in LIST:
         print("\n".join(describe_tool(n, tools[n].tool) for n in tools))
     elif cmd == "params":
@@ -218,25 +310,45 @@ async def open_server(stack, label, conn):
     return Server(label, session)
 
 
+async def open_url_server(stack, url):
+    await preflight_url(url)
+    return await open_server(stack, url, connect_url(url))
+
+
 async def open_servers(args):
     urls = args.url or ([] if args.stdio else ["http://localhost:8000/"])
     servers = []
     stack = AsyncExitStack()
     for url in urls:
         try:
-            servers.append(await open_server(stack, url, connect_url(url)))
+            servers.append(await open_url_server(stack, url))
         except Exception as e:
-            err(f"{url}: connect failed: {e}")
+            await explain_connect_failure(url, e)
     for command in args.stdio:
         try:
             servers.append(await open_server(stack, f"stdio:{command}", connect_stdio(command)))
         except Exception as e:
-            err(f"stdio:{command}: connect failed: {e}")
+            err(f"stdio:{command}: connect failed: {friendly_error(e)}")
     if servers:
         return stack, servers
     else:
         await stack.aclose()
         raise RuntimeError("no MCP servers connected")
+
+
+async def add_server(stack, servers, spec):
+    if not spec:
+        raise ValueError("usage: add <url|stdio command|--stdio command>")
+    if spec.startswith("--stdio "):
+        command = spec.removeprefix("--stdio ").strip()
+        server = await open_server(stack, f"stdio:{command}", connect_stdio(command))
+    elif spec.startswith("stdio "):
+        command = spec.removeprefix("stdio ").strip()
+        server = await open_server(stack, f"stdio:{command}", connect_stdio(command))
+    else:
+        server = await open_url_server(stack, spec)
+    servers.append(server)
+    return server
 
 
 async def main():
@@ -249,15 +361,17 @@ async def main():
     stack, servers = await open_servers(args)
     async with stack:
         tools = await load_tools(servers)
-        cmds = sorted(EXIT | LIST | SHOW | {"call", "refresh", "help", "params"})
+        cmds = sorted(EXIT | LIST | SHOW | ADD | {"call", "refresh", "help", "params"})
 
         if args.cmd:
             code = 0
             for line in args.cmd:
                 try:
-                    tools, rc, done = await run_line(servers, tools, line)
-                except Exception as e:
-                    err(str(e))
+                    tools, rc, done = await run_line(stack, servers, tools, line)
+                except BaseException as e:
+                    if isinstance(e, KeyboardInterrupt):
+                        raise
+                    err(friendly_error(e))
                     rc, done = 1, False
                 code = code or rc
                 if done:
@@ -283,12 +397,22 @@ async def main():
             if not line:
                 continue
             try:
-                tools, _, done = await run_line(servers, tools, line)
+                tools, _, done = await run_line(stack, servers, tools, line)
                 if done:
                     return
-            except Exception as e:
-                err(str(e))
+            except BaseException as e:
+                if isinstance(e, KeyboardInterrupt):
+                    raise
+                err(friendly_error(e))
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()) or 0)
+    try:
+        raise SystemExit(asyncio.run(main()) or 0)
+    except KeyboardInterrupt:
+        print()
+    except BaseException as e:
+        if isinstance(e, SystemExit):
+            raise
+        err(friendly_error(e))
+        raise SystemExit(1)
