@@ -38,6 +38,27 @@ class BoundTool:
     server: Server
 
 
+@dataclass
+class State:
+    args: object
+    stack: AsyncExitStack
+    servers: list
+    tools: dict
+
+    async def close(self):
+        await self.stack.aclose()
+
+    async def refresh(self):
+        try:
+            await self.close()
+        except Exception as e:
+            warn(f"close during refresh failed: {error_text(e)}")
+        self.stack, self.servers, self.tools = AsyncExitStack(), [], {}
+        stack, servers = await open_servers(self.args)
+        tools = await load_tools(servers)
+        self.stack, self.servers, self.tools = stack, servers, tools
+
+
 def dump(x):
     if hasattr(x, "model_dump"):
         x = x.model_dump(mode="json", exclude_none=True)
@@ -195,45 +216,45 @@ def need_arg(rest, usage):
     raise ValueError(f"usage: {usage}")
 
 
-async def run_line(stack, servers, tools, line):
+async def run_line(state, line):
     parts = line.strip().split(maxsplit=2)
     if not parts:
-        return tools, 0, False
+        return 0, False
     cmd, rest = parts[0], parts[1:]
     if cmd in EXIT:
-        return tools, 0, True
+        return 0, True
     if cmd == "help":
         print(HELP)
     elif cmd == "refresh":
-        tools = await load_tools(servers)
-        print(f"{len(tools)} tools")
+        await state.refresh()
+        print(f"{len(state.tools)} tools")
     elif cmd in ADD:
         spec = line.strip().split(maxsplit=1)[1] if len(parts) > 1 else ""
         try:
-            server = await add_server(stack, servers, spec)
+            server = await add_server(state.stack, state.servers, spec)
         except Exception as e:
             err(f"load failed: {error_text(e)}")
-            return tools, 1, False
-        tools = await load_tools(servers)
-        print(f"loaded {server.label}; {len(tools)} tools")
+            return 1, False
+        state.tools = await load_tools(state.servers)
+        print(f"loaded {server.label}; {len(state.tools)} tools")
     elif cmd in LIST:
-        print("\n".join(describe_tool(n, tools[n].tool) for n in tools))
+        print("\n".join(describe_tool(n, state.tools[n].tool) for n in state.tools))
     elif cmd == "params":
-        print_params(named_tool(tools, need_arg(rest, "params <name>")).tool)
+        print_params(named_tool(state.tools, need_arg(rest, "params <name>")).tool)
     elif cmd in SHOW:
-        dump(named_tool(tools, need_arg(rest, f"{cmd} <name>")).tool)
+        dump(named_tool(state.tools, need_arg(rest, f"{cmd} <name>")).tool)
     elif cmd == "call":
         name = need_arg(rest, "call <name> {json|k:v|pos...}")
-        bound = named_tool(tools, name)
+        bound = named_tool(state.tools, name)
         raw = rest[1] if len(rest) > 1 else ""
         print(text(await bound.server.session.call_tool(name, call_args(bound.tool, raw))))
-    elif cmd in tools:
-        bound = tools[cmd]
+    elif cmd in state.tools:
+        bound = state.tools[cmd]
         print(text(await bound.server.session.call_tool(cmd, call_args(bound.tool, " ".join(rest)))))
     else:
         err("unknown command")
-        return tools, 1, False
-    return tools, 0, False
+        return 1, False
+    return 0, False
 
 
 @asynccontextmanager
@@ -313,15 +334,15 @@ async def main():
     args = ap.parse_args()
 
     stack, servers = await open_servers(args)
-    async with stack:
-        tools = await load_tools(servers)
+    state = State(args, stack, servers, await load_tools(servers))
+    try:
         cmds = sorted(EXIT | LIST | SHOW | ADD | {"call", "refresh", "help", "params"})
 
         if args.cmd:
             code = 0
             for line in args.cmd:
                 try:
-                    tools, rc, done = await run_line(stack, servers, tools, line)
+                    rc, done = await run_line(state, line)
                 except BaseException as e:
                     if isinstance(e, KeyboardInterrupt):
                         raise
@@ -332,11 +353,11 @@ async def main():
                     break
             return code
 
-        def complete(txt, state):
+        def complete(txt, n):
             line = readline.get_line_buffer()
-            opts = cmds if " " not in line else list(tools)
+            opts = cmds if " " not in line else list(state.tools)
             hits = [x for x in opts if x.startswith(txt)]
-            return (hits + [None])[state]
+            return (hits + [None])[n]
 
         readline.parse_and_bind("tab: complete")
         readline.set_completer(complete)
@@ -351,13 +372,15 @@ async def main():
             if not line:
                 continue
             try:
-                tools, _, done = await run_line(stack, servers, tools, line)
+                _, done = await run_line(state, line)
                 if done:
                     return
             except BaseException as e:
                 if isinstance(e, KeyboardInterrupt):
                     raise
                 err(error_text(e))
+    finally:
+        await state.close()
 
 
 if __name__ == "__main__":
