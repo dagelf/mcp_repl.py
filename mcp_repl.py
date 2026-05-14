@@ -19,7 +19,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
 
-HELP = "[call] <name> {json|k:v|pos...} | refresh | help | params | (add|load) | (exit|quit|q) | (tool|show) | (list|tools|ls)"
+HELP = "[call] <name> {json|k:v|pos...} | refresh | help [name] | (add|load) | (exit|quit|q) | (tool|show) | (list|tools|ls)"
 EXIT = {"exit", "quit", "q"}
 LIST = {"list", "tools", "ls"}
 SHOW = {"tool", "show"}
@@ -224,7 +224,15 @@ async def run_line(state, line):
     if cmd in EXIT:
         return 0, True
     if cmd == "help":
-        print(HELP)
+        if rest:
+            bound = named_tool(state.tools, rest[0])
+            t = bound.tool
+            desc = t.description or ""
+            if desc:
+                print(desc)
+            print_params(t)
+        else:
+            print(HELP)
     elif cmd == "refresh":
         await state.refresh()
         print(f"{len(state.tools)} tools")
@@ -239,8 +247,6 @@ async def run_line(state, line):
         print(f"loaded {server.label}; {len(state.tools)} tools")
     elif cmd in LIST:
         print("\n".join(describe_tool(n, state.tools[n].tool) for n in state.tools))
-    elif cmd == "params":
-        print_params(named_tool(state.tools, need_arg(rest, "params <name>")).tool)
     elif cmd in SHOW:
         dump(named_tool(state.tools, need_arg(rest, f"{cmd} <name>")).tool)
     elif cmd == "call":
@@ -285,7 +291,7 @@ async def open_url_server(stack, url):
 
 
 async def open_servers(args):
-    urls = args.url or ([] if args.stdio else ["http://localhost:8000/"])
+    urls = args.url or ([] if args.stdio else ["http://192.168.2.157:8000/"])
     servers = []
     stack = AsyncExitStack()
     for url in urls:
@@ -336,7 +342,7 @@ async def main():
     stack, servers = await open_servers(args)
     state = State(args, stack, servers, await load_tools(servers))
     try:
-        cmds = sorted(EXIT | LIST | SHOW | ADD | {"call", "refresh", "help", "params"})
+        cmds = sorted(EXIT | LIST | SHOW | ADD | {"call", "refresh", "help"})
 
         if args.cmd:
             code = 0
